@@ -1,0 +1,16 @@
+# Directory for storing uploaded files
+uploads_dir: "uploads"
+
+# Log file for rate limit violations
+rate_limit_log: "rate_limit_violations.log"
+
+# General request log
+request_log: "requests.log"
+
+# Enable Gradio share link
+share: false
+
+# Rate limiting configuration
+rate_limit:
+  requests_per_window: 1
+  window_seconds: 10

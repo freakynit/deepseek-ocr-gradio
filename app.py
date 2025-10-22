@@ -128,6 +128,20 @@ model = AutoModel.from_pretrained(
 )
 model = model.eval().cuda().to(torch.bfloat16)
 
+# Define prompt templates
+PROMPT_TEMPLATES = {
+    "Document to Markdown": "<|grounding|>Convert the document to markdown.",
+    "OCR Image": "<|grounding|>OCR this image.",
+    "Free OCR (No Layout)": "Free OCR.",
+    "Parse Figure": "Parse the figure.",
+    "Describe Image": "Describe this image in detail.",
+    "Custom": ""
+}
+
+def update_prompt(template_choice):
+    """Update prompt based on template selection"""
+    return PROMPT_TEMPLATES[template_choice]
+
 def process_image(image, model_size, custom_prompt, use_grounding, request: gr.Request):
     """Process image with DeepSeek-OCR"""
     
@@ -153,8 +167,8 @@ def process_image(image, model_size, custom_prompt, use_grounding, request: gr.R
     
     config_model = configs[model_size]
     
-    # Build prompt
-    if use_grounding:
+    # Build prompt - only add grounding if checkbox is checked and not already in prompt
+    if use_grounding and "<|grounding|>" not in custom_prompt:
         prompt = f"<image>\n<|grounding|>{custom_prompt}"
     else:
         prompt = f"<image>\n{custom_prompt}"
@@ -205,15 +219,22 @@ with gr.Blocks(title="DeepSeek OCR") as demo:
                 label="Model Size"
             )
             
-            use_grounding = gr.Checkbox(
-                value=True,
-                label="Use Grounding Mode"
+            prompt_template = gr.Dropdown(
+                choices=list(PROMPT_TEMPLATES.keys()),
+                value="Document to Markdown",
+                label="Prompt Template"
             )
             
             custom_prompt = gr.Textbox(
-                value="Convert the document to markdown.",
-                label="Prompt",
-                lines=2
+                value=PROMPT_TEMPLATES["Document to Markdown"],
+                label="Prompt (editable)",
+                lines=2,
+                interactive=True
+            )
+            
+            use_grounding = gr.Checkbox(
+                value=True,
+                label="Use Grounding Mode"
             )
             
             submit_btn = gr.Button("Extract Text", variant="primary")
@@ -232,7 +253,22 @@ with gr.Blocks(title="DeepSeek OCR") as demo:
     - **Base**: 1024×1024 - Good accuracy
     - **Large**: 1280×1280 - Best accuracy
     - **Gundam**: 1024 base + 640 image with crop mode - Optimized for documents
+    
+    ### Prompt Templates:
+    - **Document to Markdown**: Converts documents with layout preservation
+    - **OCR Image**: Standard OCR for any image
+    - **Free OCR**: Simple text extraction without layout
+    - **Parse Figure**: Extracts information from charts/diagrams
+    - **Describe Image**: Detailed image description
+    - **Custom**: Write your own prompt (e.g., `Locate <|ref|>text<|/ref|> in the image.`)
     """)
+    
+    # Update prompt when template changes
+    prompt_template.change(
+        fn=update_prompt,
+        inputs=prompt_template,
+        outputs=custom_prompt
+    )
     
     submit_btn.click(
         fn=process_image,

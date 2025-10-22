@@ -238,7 +238,7 @@ with gr.Blocks(title="DeepSeek OCR") as demo:
                 label="Use Grounding Mode"
             )
             
-            submit_btn = gr.Button("Extract Text", variant="primary")
+            submit_btn = gr.Button("Run", variant="primary")
         
         with gr.Column():
             output = gr.Textbox(

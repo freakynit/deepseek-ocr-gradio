@@ -8,6 +8,7 @@
 # python -m pip install --upgrade pip setuptools wheel
 # pip install torch==2.3.1
 # pip install flash-attn==2.7.3 --no-build-isolation
+# pip install gradio torchvision==0.18
 
 import gradio as gr
 from transformers import AutoModel, AutoTokenizer

@@ -6,9 +6,8 @@
 
 # pip install addict transformers==4.46.3 tokenizers==0.20.3 PyMuPDF img2pdf einops easydict addict Pillow numpy
 # python -m pip install --upgrade pip setuptools wheel
-# pip install torch==2.3.1
+# pip install torch==2.3.1 'accelerate>=0.26.0'
 # pip install flash-attn==2.7.3 --no-build-isolation
-# pip install gradio torchvision==0.18
 
 import gradio as gr
 from transformers import AutoModel, AutoTokenizer
@@ -22,9 +21,17 @@ from pathlib import Path
 import random
 import string
 from collections import defaultdict
-from functools import wraps
+from PIL import Image, ImageDraw
+import re
+from typing import Tuple, Optional
 from io import StringIO
 import sys
+
+# Bounding box constants
+BOUNDING_BOX_PATTERN = re.compile(r"<\|det\|>\[\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]\]<\|/det\|>")
+BOUNDING_BOX_COLOR = "red"
+BOUNDING_BOX_WIDTH = 3
+NORMALIZATION_FACTOR = 1000
 
 # Load configuration
 def load_config():
@@ -115,6 +122,112 @@ def save_request_data(request_id, image, prompt, ip_address):
     
     return request_dir
 
+def parse_ocr_output(raw_output: str) -> str:
+    """Parse raw OCR output to remove debug info and format cleanly"""
+    lines = raw_output.split('\n')
+    parsed_lines = []
+    in_content = False
+    
+    # Patterns to skip (debug/metadata)
+    skip_patterns = [
+        'BASE:', 'PATCHES:', 'NO PATCHES', 'directly resize',
+        'image size:', 'valid image tokens:', 'output texts tokens',
+        'compression ratio:', 'save results:', '====', '===',
+    ]
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        # Skip empty lines and debug patterns
+        if not stripped or any(pattern in line for pattern in skip_patterns):
+            continue
+        
+        # Handle ref/det structured data
+        if '<|ref|>' in line:
+            # Extract all reference-detection pairs from this line
+            import re
+            pattern = r'<\|ref\|>(.*?)<\|/ref\|>(?:<\|det\|>\[\[(.*?)\]\]<\|/det\|>)?'
+            matches = re.findall(pattern, line)
+            
+            if matches:
+                for ref_text, coords in matches:
+                    if coords:
+                        # Format with coordinates
+                        parsed_lines.append(f"• **{ref_text}** → `[{coords}]`")
+                    else:
+                        # Just the reference text
+                        parsed_lines.append(ref_text.strip())
+            continue
+        
+        # Regular content - add as is
+        parsed_lines.append(stripped)
+    
+    result = '\n'.join(parsed_lines)
+    return result if result.strip() else raw_output
+
+
+def extract_and_draw_bounding_boxes(text_result: str, original_image: Image.Image) -> Optional[Image.Image]:
+    """
+    Extract bounding box coordinates from text result and draw them on the image.
+    
+    Args:
+        text_result: OCR text result containing bounding box coordinates
+        original_image: Original PIL image to draw on
+        
+    Returns:
+        PIL image with bounding boxes drawn, or None if no coordinates found
+    """
+    matches = list(BOUNDING_BOX_PATTERN.finditer(text_result))
+    
+    if not matches:
+        return None
+    
+    print(f"✅ Found {len(matches)} bounding boxes. Drawing on original image.")
+    
+    # Create a copy of the original image for drawing
+    image_with_bboxes = original_image.copy()
+    draw = ImageDraw.Draw(image_with_bboxes)
+    w, h = original_image.size
+    
+    # Pre-calculate scale factors for better performance
+    w_scale = w / NORMALIZATION_FACTOR
+    h_scale = h / NORMALIZATION_FACTOR
+    
+    for match in matches:
+        # Extract and scale coordinates
+        coords = tuple(int(c) for c in match.groups())
+        x1_norm, y1_norm, x2_norm, y2_norm = coords
+        
+        # Scale normalized coordinates
+        x1 = int(x1_norm * w_scale)
+        y1 = int(y1_norm * h_scale)
+        x2 = int(x2_norm * w_scale)
+        y2 = int(y2_norm * h_scale)
+        
+        # Draw rectangle
+        draw.rectangle([x1, y1, x2, y2], outline=BOUNDING_BOX_COLOR, width=BOUNDING_BOX_WIDTH)
+    
+    return image_with_bboxes
+
+def find_result_image(path: str) -> Optional[Image.Image]:
+    """
+    Find pre-generated result image in the specified path.
+    
+    Args:
+        path: Directory path to search for result image
+        
+    Returns:
+        PIL image if found, otherwise None
+    """
+    for filename in os.listdir(path):
+        if "grounding" in filename or "result" in filename:
+            try:
+                image_path = os.path.join(path, filename)
+                return Image.open(image_path)
+            except Exception as e:
+                print(f"Error opening result image {filename}: {e}")
+    return None
+
 # Setup environment and model
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 model_name = 'deepseek-ai/DeepSeek-OCR'
@@ -124,10 +237,12 @@ tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 model = AutoModel.from_pretrained(
     model_name, 
     _attn_implementation='flash_attention_2', 
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
     trust_remote_code=True, 
     use_safetensors=True
 )
-model = model.eval().cuda().to(torch.bfloat16)
+model = model.eval().cuda()
 
 # Define prompt templates
 PROMPT_TEMPLATES = {
@@ -136,6 +251,7 @@ PROMPT_TEMPLATES = {
     "Free OCR (No Layout)": "Free OCR.",
     "Parse Figure": "Parse the figure.",
     "Describe Image": "Describe this image in detail.",
+    "Locate Object by Reference": "",
     "Custom": ""
 }
 
@@ -143,7 +259,20 @@ def update_prompt(template_choice):
     """Update prompt based on template selection"""
     return PROMPT_TEMPLATES[template_choice]
 
-def process_image(image, model_size, custom_prompt, use_grounding, request: gr.Request):
+def update_ref_text_visibility(template_choice):
+    """Show/hide reference text input and help based on template"""
+    if template_choice == "Locate Object by Reference":
+        help_text = """
+**💡 Quick Guide:**
+- **Reference Text**: Simply type what you want to find (e.g., "red car", "teacher")
+- **Prompt field**: Leave empty unless you need advanced custom prompts
+- Reference Text takes priority if both are filled
+        """
+        return gr.Textbox(visible=True), gr.Markdown(value=help_text, visible=True)
+    else:
+        return gr.Textbox(visible=False), gr.Markdown(value="", visible=False)
+
+def process_image(image, model_size, custom_prompt, use_grounding, ref_text, request: gr.Request) -> Tuple[str, Optional[Image.Image]]:
     """Process image with DeepSeek-OCR"""
     
     # Get client IP
@@ -151,7 +280,7 @@ def process_image(image, model_size, custom_prompt, use_grounding, request: gr.R
     
     # Check rate limit
     if not check_rate_limit(ip_address):
-        return f"Rate limit exceeded. Please wait {config['rate_limit']['window_seconds']} seconds."
+        return f"Rate limit exceeded. Please wait {config['rate_limit']['window_seconds']} seconds.", None
     
     # Generate request ID and save data
     request_id = generate_request_id()
@@ -168,11 +297,16 @@ def process_image(image, model_size, custom_prompt, use_grounding, request: gr.R
     
     config_model = configs[model_size]
     
-    # Build prompt - only add grounding if checkbox is checked and not already in prompt
-    if use_grounding and "<|grounding|>" not in custom_prompt:
-        prompt = f"<image>\n<|grounding|>{custom_prompt}"
+    # Build prompt
+    if ref_text and ref_text.strip():
+        # Localization task
+        prompt = f"<image>\nLocate <|ref|>{ref_text.strip()}<|/ref|> in the image."
     else:
-        prompt = f"<image>\n{custom_prompt}"
+        # Regular tasks - add grounding if checkbox is checked
+        if use_grounding and "<|grounding|>" not in custom_prompt:
+            prompt = f"<image>\n<|grounding|>{custom_prompt}"
+        else:
+            prompt = f"<image>\n{custom_prompt}"
     
     # Create temp directory for processing
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -202,13 +336,24 @@ def process_image(image, model_size, custom_prompt, use_grounding, request: gr.R
 
         # Get captured text
         console_output = captured_output.getvalue()
+        text_result = console_output if console_output else str(result)
         
-        return console_output if console_output else str(result)
+        # Parse the output for clean display
+        parsed_result = parse_ocr_output(text_result)
+        
+        # Try to extract and draw bounding boxes
+        result_image = extract_and_draw_bounding_boxes(text_result, image)
+        
+        # If no bounding boxes found in text, try to find pre-generated result image
+        if result_image is None:
+            result_image = find_result_image(temp_dir)
+        
+        return text_result, parsed_result, result_image
 
 # Create Gradio interface
 with gr.Blocks(title="DeepSeek OCR") as demo:
     gr.Markdown("# DeepSeek-OCR Interface")
-    gr.Markdown("Extract text or convert documents to markdown")
+    gr.Markdown("Extract text, convert documents to markdown, or locate objects with bounding boxes")
     
     with gr.Row():
         with gr.Column():
@@ -224,6 +369,18 @@ with gr.Blocks(title="DeepSeek OCR") as demo:
                 choices=list(PROMPT_TEMPLATES.keys()),
                 value="Document to Markdown",
                 label="Prompt Template"
+            )
+
+            ref_text_input = gr.Textbox(
+                label="Reference Text (for localization task)",
+                placeholder="e.g., teacher, 20-10, a red car...",
+                visible=False,
+                lines=1
+            )
+
+            help_box = gr.Markdown(
+                "",
+                visible=False
             )
             
             custom_prompt = gr.Textbox(
@@ -241,10 +398,28 @@ with gr.Blocks(title="DeepSeek OCR") as demo:
             submit_btn = gr.Button("Run", variant="primary")
         
         with gr.Column():
-            output = gr.Textbox(
-                label="OCR Result",
-                lines=20,
-                show_copy_button=True
+            show_raw = gr.Checkbox(
+                value=False,
+                label="Show Raw Output (with debug info)"
+            )
+            
+            parsed_output = gr.Textbox(
+                label="OCR Result (Cleaned)",
+                lines=15,
+                show_copy_button=True,
+                visible=True
+            )
+            
+            raw_output = gr.Textbox(
+                label="OCR Result (Raw)",
+                lines=15,
+                show_copy_button=True,
+                visible=False
+            )
+
+            output_image = gr.Image(
+                label="Result Image (with bounding boxes if detected)",
+                type="pil"
             )
     
     gr.Markdown("""
@@ -261,20 +436,43 @@ with gr.Blocks(title="DeepSeek OCR") as demo:
     - **Free OCR**: Simple text extraction without layout
     - **Parse Figure**: Extracts information from charts/diagrams
     - **Describe Image**: Detailed image description
-    - **Custom**: Write your own prompt (e.g., `Locate <|ref|>text<|/ref|> in the image.`)
-    """)
+    - **Locate Object by Reference**: Find specific objects/text (requires reference text input)
+    - **Custom**: Write your own prompt
     
-    # Update prompt when template changes
+    ### Bounding Box Support:
+    - Automatically detects and draws bounding boxes when available in the result
+    - Particularly useful for "Locate Object by Reference" tasks
+    - Boxes are drawn in red on the original image
+    """)
+
+    # Toggle between raw and parsed output (client-side)
+    def toggle_output_display(show_raw_checked):
+        return gr.Textbox(visible=not show_raw_checked), gr.Textbox(visible=show_raw_checked)
+    
+    show_raw.change(
+        fn=toggle_output_display,
+        inputs=[show_raw],
+        outputs=[parsed_output, raw_output]
+    )
+    
+    # Handler 1: Update the prompt text
     prompt_template.change(
         fn=update_prompt,
         inputs=prompt_template,
         outputs=custom_prompt
     )
+
+    # Handler 2: Update visibility and help
+    prompt_template.change(
+        fn=update_ref_text_visibility,
+        inputs=prompt_template,
+        outputs=[ref_text_input, help_box]  # Both components here
+    )
     
     submit_btn.click(
         fn=process_image,
-        inputs=[image_input, model_size, custom_prompt, use_grounding],
-        outputs=output
+        inputs=[image_input, model_size, custom_prompt, use_grounding, ref_text_input],
+        outputs=[raw_output, parsed_output, output_image]  # Note: raw first, then parsed
     )
 
 if __name__ == "__main__":

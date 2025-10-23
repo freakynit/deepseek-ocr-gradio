@@ -11,3 +11,4 @@ torch==2.3.1
 flash-attn==2.7.3
 gradio>=5.49.1
 torchvision==0.18
+accelerate>=0.26.0

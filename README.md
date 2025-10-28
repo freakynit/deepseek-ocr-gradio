@@ -1,6 +1,6 @@
 ## Gradio app for Deepseek-OCR
 
-> Tested with Python 3.12 on Ubuntu 22
+> Tested with Python 3.12 on Ubuntu 24
 
 ### Quick Start
 
